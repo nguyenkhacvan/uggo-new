@@ -1,140 +1,115 @@
-use std::sync::Arc;
-
-use native_tls::TlsConnector;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use lcc::RiotLockFile;
+use reqwest::{
+    header::{self, HeaderMap, HeaderValue},
+    Client, StatusCode,
+};
+use serde::{de::DeserializeOwned, Serialize};
+use std::time::Duration;
 use thiserror::Error;
-use ureq::{Agent, AgentBuilder};
+use ugg_types::{
+    client_runepage::{NewRunePage, RunePage},
+    client_summoner::Summoner,
+};
 
-use ugg_types::client_runepage::{NewRunePage, RunePage, RunePages};
-use ugg_types::client_summoner::ClientSummoner;
+pub mod lcc;
 
-mod lcc;
-use lcc::{LeagueClientConnector, RiotLockFile};
+pub struct LeagueClient {
+    client: Client,
+    base_url: String,
+}
 
 #[derive(Error, Debug)]
-pub enum LOLClientError {
-    #[error("Unable to create TLS connector")]
-    TlsConnectorError(#[from] native_tls::Error),
-    #[error("Unable to read lockfile")]
-    LockfileReadError(#[from] lcc::LeagueConnectorError),
-    #[error("Linux is not supported")]
-    LinuxNotSupported,
+pub enum LeagueClientError {
+    #[snafu(display("Reqwest error: {}", source))]
+    #[error("Reqwest error: {0}")]
+    ReqwestError(#[from] reqwest::Error),
+
+    #[error("API returned error code: {0}")]
+    ApiError(StatusCode),
 }
 
-pub struct LOLClientAPI {
-    agent: Agent,
-    lockfile: RiotLockFile,
-}
+type Result<T> = std::result::Result<T, LeagueClientError>;
 
-impl LOLClientAPI {
-    pub fn new() -> Result<LOLClientAPI, LOLClientError> {
-        if cfg!(target_os = "linux") {
-            return Err(LOLClientError::LinuxNotSupported);
-        }
-        Ok(LOLClientAPI {
-            agent: AgentBuilder::new()
-                .tls_connector(Arc::new(
-                    TlsConnector::builder()
-                        .danger_accept_invalid_certs(true)
-                        .build()?,
-                ))
-                .build(),
-            lockfile: LeagueClientConnector::parse_lockfile()?,
+impl LeagueClient {
+    pub fn new(lockfile: RiotLockFile) -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        
+        // Setup Authorization Header: "Basic <base64_auth>"
+        let auth_value = format!("Basic {}", lockfile.b64_auth);
+        let mut auth_header = HeaderValue::from_str(&auth_value)
+            .map_err(|_| reqwest::Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid Auth Header")))?;
+        auth_header.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, auth_header);
+
+        // Setup Client với cấu hình đặc biệt cho LCU
+        let client = Client::builder()
+            .default_headers(headers)
+            // QUAN TRỌNG: LCU dùng self-signed cert, phải tắt verify
+            .danger_accept_invalid_certs(true)
+            .user_agent("uggo-lol-client/0.5.1")
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        Ok(Self {
+            client,
+            base_url: format!("{}://127.0.0.1:{}", lockfile.protocol, lockfile.port),
         })
     }
 
-    fn get_data<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
-        match self
-            .agent
-            .get(url)
-            .set(
-                "Authorization",
-                &format!("Basic {}", self.lockfile.b64_auth),
-            )
-            .call()
-        {
-            Ok(response) => {
-                if response.status() == 200 {
-                    response.into_json().ok()
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
+    /// Helper nội bộ để thực hiện GET request
+    async fn get<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T> {
+        let url = format!("{}{}", self.base_url, endpoint);
+        let response = self.client.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(LeagueClientError::ApiError(response.status()));
         }
+
+        Ok(response.json::<T>().await?)
     }
 
-    fn delete_data(&self, url: &str) {
-        match self
-            .agent
-            .delete(url)
-            .set(
-                "Authorization",
-                &format!("Basic {}", self.lockfile.b64_auth),
-            )
-            .call()
-        {
-            Err(_) | Ok(_) => (),
+    /// Helper nội bộ để thực hiện DELETE request
+    async fn delete(&self, endpoint: &str) -> Result<()> {
+        let url = format!("{}{}", self.base_url, endpoint);
+        let response = self.client.delete(&url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(LeagueClientError::ApiError(response.status()));
         }
+        Ok(())
     }
 
-    fn post_data<T: Serialize>(&self, url: &str, data: &T) {
-        match self
-            .agent
-            .post(url)
-            .set(
-                "Authorization",
-                &format!("Basic {}", self.lockfile.b64_auth),
-            )
-            .send_json(data)
-        {
-            Err(_) | Ok(_) => (),
+    /// Helper nội bộ để thực hiện POST request
+    async fn post<T: Serialize, R: DeserializeOwned>(&self, endpoint: &str, body: &T) -> Result<R> {
+        let url = format!("{}{}", self.base_url, endpoint);
+        let response = self.client.post(&url).json(body).send().await?;
+
+        if !response.status().is_success() {
+            return Err(LeagueClientError::ApiError(response.status()));
         }
+
+        Ok(response.json::<R>().await?)
     }
 
-    #[must_use]
-    pub fn get_summoner_info(&self) -> Option<ClientSummoner> {
-        self.get_data::<ClientSummoner>(&format!(
-            "https://127.0.0.1:{}/lol-summoner/v1/current-summoner",
-            self.lockfile.port
-        ))
+    // --- API Methods (Mapped to LCU Endpoints) ---
+
+    pub async fn get_current_summoner(&self) -> Result<Summoner> {
+        self.get("/lol-summoner/v1/current-summoner").await
     }
 
-    #[must_use]
-    pub fn get_current_rune_page(&self) -> Option<RunePage> {
-        match self.get_data::<RunePages>(&format!(
-            "https://127.0.0.1:{}/lol-perks/v1/pages",
-            self.lockfile.port
-        )) {
-            Some(data) => {
-                for page in &data {
-                    if page.name.starts_with("uggo:") && page.is_deletable {
-                        return Some(page.clone());
-                    }
-                }
-                for page in &data {
-                    if page.current && page.is_deletable {
-                        return Some(page.clone());
-                    }
-                }
-                None
-            }
-            None => None,
-        }
+    pub async fn get_rune_pages(&self) -> Result<Vec<RunePage>> {
+        self.get("/lol-perks/v1/pages").await
     }
 
-    pub fn update_rune_page(&self, old_page_id: i64, rune_page: &NewRunePage) {
-        self.delete_data(&format!(
-            "https://127.0.0.1:{}/lol-perks/v1/pages/{}",
-            self.lockfile.port, old_page_id
-        ));
-        self.post_data::<NewRunePage>(
-            &format!(
-                "https://127.0.0.1:{}/lol-perks/v1/pages",
-                self.lockfile.port
-            ),
-            rune_page,
-        );
+    pub async fn get_current_rune_page(&self) -> Result<RunePage> {
+        self.get("/lol-perks/v1/currentpage").await
+    }
+
+    pub async fn delete_rune_page(&self, id: i64) -> Result<()> {
+        self.delete(&format!("/lol-perks/v1/pages/{}", id)).await
+    }
+
+    pub async fn create_rune_page(&self, page: &NewRunePage) -> Result<RunePage> {
+        self.post("/lol-perks/v1/pages", page).await
     }
 }

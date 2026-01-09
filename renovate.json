@@ -1,0 +1,38 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "ignorePresets": ["group:monorepos"],
+  "ignoreDeps": ["google-github-actions/release-please-action"],
+  "rangeStrategy": "update-lockfile",
+  "packageRules": [
+    {
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "automerge": true
+    },
+    {
+      "matchCategories": ["rust"],
+      "matchDepTypes": ["dependencies"],
+      "semanticCommitType": "fix"
+    },
+    {
+      "matchPackageNames": ["serde"],
+      "semanticCommitType": "fix"
+    },
+    {
+      "matchCategories": ["rust"],
+      "matchDepTypes": ["dev-dependencies"],
+      "semanticCommitType": "chore"
+    },
+    {
+      "groupName": "ratatui",
+      "groupSlug": "ratatui",
+      "matchDatasources": ["crate"],
+      "matchPackageNames": ["ratatui", "tui-input"]
+    },
+    {
+      "matchFileNames": ["crates/lol-client/Cargo.toml"],
+      "matchPackageNames": ["ureq"],
+      "allowedVersions": "<3"
+    }
+  ]
+}

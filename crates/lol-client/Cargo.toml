@@ -1,0 +1,23 @@
+[package]
+name = "uggo-lol-client"
+version = "0.5.1" # Bump version
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "uggo dependency -- API bindings for the League of Legends client"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+# native-tls = "0.2.14" -> Bỏ để dùng rustls hiện đại hơn
+regex = "1.11.1"
+serde = { version = "1.0.218", features = ["derive"] }
+snafu = "0.8.7"
+thiserror = "2.0.11"
+# Thay thế ureq bằng reqwest
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Thêm sysinfo để tìm process LoL nhanh gấp 100 lần PowerShell
+sysinfo = "0.30" 
+ugg-types = { version = "0.9.0", path = "../ugg-types" }

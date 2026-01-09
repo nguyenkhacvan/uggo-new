@@ -1,451 +1,113 @@
-use crate::util::sha256;
-use ddragon::models::Augment;
-use ddragon::models::champions::ChampionShort;
-use ddragon::models::items::Item;
-use ddragon::models::runes::RuneElement;
-use ddragon::{Client, ClientBuilder};
-use levenshtein::levenshtein;
-use lru::LruCache;
-use reqwest::Client as ReqwestClient;
-use serde::de::DeserializeOwned;
+use anyhow::Result;
+use reqwest::Client;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use thiserror::Error;
-use ugg_types::mappings::{self, Rank};
-use ugg_types::matchups::{MatchupData, Matchups};
-use ugg_types::overview::{ChampOverview, Overview};
-use ugg_types::rune::RuneExtended;
-
-mod util;
-
-type UggAPIVersions = HashMap<String, HashMap<String, String>>;
-
-#[derive(Error, Debug)]
-pub enum UggError {
-    #[error("DDragon error")]
-    DDragonError(#[from] ddragon::ClientError),
-    #[error("HTTP request failed: {0}")]
-    RequestError(#[from] reqwest::Error),
-    #[error("JSON parsing failed")]
-    ParseError(#[from] simd_json::Error),
-    #[error("Missing region or rank entry")]
-    MissingRegionOrRank,
-    #[error("Missing role entry")]
-    MissingRole,
-    #[error("Unknown error occurred")]
-    Unknown,
-}
-
-pub struct DataApi {
-    client: ReqwestClient,
-    ddragon: Client,
-    // RefCell không an toàn trong Async (không Sync), dùng Mutex thay thế.
-    overview_cache: Mutex<LruCache<String, ChampOverview>>,
-    matchup_cache: Mutex<LruCache<String, Matchups>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SupportedVersion {
-    pub ddragon: String,
-    pub ugg: String,
-}
+use ugg_types::{
+    mappings::{Mode, Region, Role},
+    matchups::MatchupData,
+    overview::Overview,
+};
 
 pub struct UggApi {
-    api: DataApi,
-    api_versions: UggAPIVersions,
-
-    pub current_version: String,
-    pub allowed_versions: Vec<SupportedVersion>,
-    pub patch_version: String,
-    pub champ_data: HashMap<String, ChampionShort>,
-    pub items: HashMap<String, Item>,
-    pub runes: HashMap<i64, RuneExtended<RuneElement>>,
-    pub summoner_spells: HashMap<i64, String>,
-    pub arena_augments: HashMap<i64, Augment>,
-}
-
-impl DataApi {
-    pub fn new(version: Option<String>, cache_dir: Option<PathBuf>) -> Result<Self, UggError> {
-        let mut client_builder = ClientBuilder::new();
-        let safe_dir = cache_dir.ok_or(UggError::Unknown)?;
-        if let Some(v) = version {
-            client_builder = client_builder.version(v.as_str());
-        }
-        if let Some(dir) = safe_dir.clone().to_str() {
-            client_builder = client_builder.cache(dir);
-        }
-
-        let cache_size = NonZeroUsize::new(50).unwrap_or(NonZeroUsize::MIN);
-        
-        // Tạo Reqwest Client với cấu hình tối ưu
-        let client = ReqwestClient::builder()
-            .user_agent("ugg-api/0.6.2")
-            .build()?;
-
-        Ok(Self {
-            client,
-            ddragon: client_builder.build()?,
-            overview_cache: Mutex::new(LruCache::new(cache_size)),
-            matchup_cache: Mutex::new(LruCache::new(cache_size)),
-        })
-    }
-
-    /// Helper Async fetch data
-    async fn get_data<T: DeserializeOwned>(&self, url: &str) -> Result<T, UggError> {
-        let response = self.client.get(url).send().await?;
-        let bytes = response.bytes().await?;
-        
-        // simd_json cần mutable slice
-        let mut vec_bytes = bytes.to_vec();
-        simd_json::serde::from_slice(&mut vec_bytes).map_err(UggError::ParseError)
-    }
-
-    pub fn get_current_version(&self) -> String {
-        self.ddragon.version.clone()
-    }
-
-    pub async fn get_supported_versions(&self) -> Result<Vec<String>, UggError> {
-        self.get_data("https://ddragon.leagueoflegends.com/api/versions.json").await
-    }
-
-    pub fn get_champ_data(&self) -> Result<HashMap<String, ChampionShort>, UggError> {
-        Ok(self.ddragon.champions()?.data)
-    }
-
-    pub fn get_items(&self) -> Result<HashMap<String, Item>, UggError> {
-        Ok(self.ddragon.items()?.data)
-    }
-
-    pub fn get_runes(&self) -> Result<HashMap<i64, RuneExtended<RuneElement>>, UggError> {
-        let rune_data = self.ddragon.runes()?;
-
-        let mut processed_data = HashMap::new();
-        for class in rune_data {
-            for (slot_index, slot) in class.slots.iter().enumerate() {
-                for (index, rune) in slot.runes.iter().enumerate() {
-                    let extended_rune = RuneExtended {
-                        rune: (*rune).clone(),
-                        slot: slot_index as u64,
-                        index: index as u64,
-                        siblings: slot.runes.len() as u64,
-                        parent: class.name.clone(),
-                        parent_id: class.id,
-                    };
-                    processed_data.insert(rune.id, extended_rune);
-                }
-            }
-        }
-        Ok(processed_data)
-    }
-
-    pub fn get_summoner_spells(&self) -> Result<HashMap<i64, String>, UggError> {
-        let summoner_data = self.ddragon.summoner_spells()?;
-
-        let mut reduced_data: HashMap<i64, String> = HashMap::new();
-        for (_spell, spell_info) in summoner_data.data {
-            reduced_data.insert(
-                spell_info.key.parse::<i64>().ok().unwrap_or(0),
-                spell_info.name,
-            );
-        }
-        Ok(reduced_data)
-    }
-
-    pub fn get_arena_augments(&self) -> Result<HashMap<i64, Augment>, UggError> {
-        let augment_data = self.ddragon.arena_augments()?;
-        let mut reduced_data: HashMap<i64, Augment> = HashMap::new();
-        for augment in augment_data {
-            reduced_data.insert(augment.id, augment);
-        }
-        Ok(reduced_data)
-    }
-
-    pub async fn get_ugg_api_versions(&self) -> Result<UggAPIVersions, UggError> {
-        self.get_data::<UggAPIVersions>("https://static.bigbrain.gg/assets/lol/riot_patch_update/prod/ugg/ugg-api-versions.json").await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn get_stats(
-        &self,
-        patch: &str,
-        champ: &ChampionShort,
-        role: mappings::Role,
-        region: mappings::Region,
-        mode: mappings::Mode,
-        build: mappings::Build,
-        api_versions: &HashMap<String, HashMap<String, String>>,
-    ) -> Result<(Overview, mappings::Role), UggError> {
-        let api_version =
-            if api_versions.contains_key(patch) && api_versions[patch].contains_key("overview") {
-                api_versions[patch]["overview"].as_str()
-            } else {
-                "1.5.0"
-            };
-        let data_path = &format!(
-            "{}/{}/{}/{}/{}",
-            build.to_api_string(),
-            patch,
-            mode.to_api_string(),
-            champ.key.as_str(),
-            api_version
-        );
-        let cache_path = format!("{data_path}-{region}-{role}");
-
-        // Scope for cache lock to avoid holding it across await
-        let cached_data = {
-            let mut cache = self.overview_cache.lock().unwrap();
-            cache.get(&sha256(&cache_path)).cloned()
-        };
-
-        let stats_data = if let Some(data) = cached_data {
-            data
-        } else {
-            let fetched = self.get_data::<ChampOverview>(&format!("https://stats2.u.gg/lol/1.5/{data_path}.json")).await?;
-            // Update cache
-            let mut cache = self.overview_cache.lock().unwrap();
-            cache.put(sha256(&cache_path), fetched.clone());
-            fetched
-        };
-
-        let data_by_role = Rank::preferred_order()
-            .iter()
-            .find_map(|rank| {
-                stats_data
-                    .get(&region)
-                    .and_then(|region_data| region_data.get(rank))
-            })
-            .ok_or(UggError::MissingRegionOrRank)?;
-
-        data_by_role
-            .get_key_value(&role)
-            .or_else(|| {
-                data_by_role
-                    .iter()
-                    .max_by_key(|(_, data)| data.data.matches())
-                    .map(|(role, _)| role)
-                    .and_then(|r| data_by_role.get_key_value(r))
-            })
-            .map(|(role, data)| (data.data.clone(), *role))
-            .ok_or(UggError::MissingRole)
-    }
-
-    pub async fn get_matchups(
-        &self,
-        patch: &str,
-        champ: &ChampionShort,
-        role: mappings::Role,
-        region: mappings::Region,
-        mode: mappings::Mode,
-        api_versions: &HashMap<String, HashMap<String, String>>,
-    ) -> Result<(MatchupData, mappings::Role), UggError> {
-        let api_version =
-            if api_versions.contains_key(patch) && api_versions[patch].contains_key("matchups") {
-                api_versions[patch]["matchups"].as_str()
-            } else {
-                "1.5.0"
-            };
-        let data_path = &format!(
-            "{}/{}/{}/{}",
-            patch,
-            mode.to_api_string(),
-            champ.key.as_str(),
-            api_version
-        );
-        let cache_path = format!("{data_path}-{region}-{role}");
-
-        // Scope for cache lock
-        let cached_data = {
-            let mut cache = self.matchup_cache.lock().unwrap();
-            cache.get(&sha256(&cache_path)).cloned()
-        };
-
-        let matchup_data = if let Some(data) = cached_data {
-            data
-        } else {
-            let fetched = self.get_data::<Matchups>(&format!(
-                "https://stats2.u.gg/lol/1.5/matchups/{data_path}.json",
-            )).await?;
-            
-            let mut cache = self.matchup_cache.lock().unwrap();
-            cache.put(sha256(&cache_path), fetched.clone());
-            fetched
-        };
-
-        let data_by_role = Rank::preferred_order()
-            .iter()
-            .find_map(|rank| {
-                matchup_data
-                    .get(&region)
-                    .and_then(|region_data| region_data.get(rank))
-            })
-            .ok_or(UggError::MissingRegionOrRank)?;
-
-        data_by_role
-            .get_key_value(&role)
-            .or_else(|| {
-                data_by_role
-                    .iter()
-                    .max_by_key(|(_, data)| data.data.total_matches)
-                    .map(|(role, _)| role)
-                    .and_then(|r| data_by_role.get_key_value(r))
-            })
-            .map(|(role, data)| (data.data.clone(), *role))
-            .ok_or(UggError::MissingRole)
-    }
+    client: Client,
+    pub api_version: String,
 }
 
 impl UggApi {
-    // Chuyển new thành async vì có gọi network
-    pub async fn new(version: Option<String>, cache_dir: Option<PathBuf>) -> Result<Self, UggError> {
-        let mut inner_api = DataApi::new(version, cache_dir.clone())?;
+    pub fn new() -> Self {
+        let client = Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            .build()
+            .unwrap_or_default();
 
-        let mut current_version = inner_api.get_current_version();
-        let allowed_versions = inner_api.get_supported_versions().await?; // Await
-        let ugg_api_versions = inner_api.get_ugg_api_versions().await?;   // Await
-        
-        let versions_ugg_supports = allowed_versions
-            .into_iter()
-            .map(|v| SupportedVersion {
-                ddragon: v.clone(),
-                ugg: (v.split('.').take(2).collect::<Vec<&str>>()).join("_"),
-            })
-            .filter(|v| ugg_api_versions.contains_key(&v.ugg))
-            .collect::<Vec<_>>();
-
-        if let Some(default_if_fails) = versions_ugg_supports.first() {
-            if !versions_ugg_supports
-                .iter()
-                .any(|v| v.ddragon == current_version)
-            {
-                // Re-initialize if version mismatch
-                inner_api = DataApi::new(Some(default_if_fails.ddragon.clone()), cache_dir)?;
-                current_version = inner_api.get_current_version();
-            }
-        } else {
-            return Err(UggError::Unknown);
-        }
-
-        // Các hàm này dùng ddragon (blocking cache/fs), chấp nhận được trong quá trình init
-        let champ_data = inner_api.get_champ_data()?;
-        let items = inner_api.get_items()?;
-        let runes = inner_api.get_runes()?;
-        let summoner_spells = inner_api.get_summoner_spells()?;
-        let arena_augments = inner_api
-            .get_arena_augments()
-            .unwrap_or_else(|_| HashMap::new());
-
-        let mut patch_version_split = current_version.split('.').collect::<Vec<&str>>();
-        patch_version_split.remove(patch_version_split.len() - 1);
-        let patch_version = patch_version_split.join("_");
-
-        Ok(Self {
-            api: inner_api,
-            allowed_versions: versions_ugg_supports,
-            api_versions: ugg_api_versions,
-            current_version,
-            patch_version,
-            champ_data,
-            items,
-            runes,
-            summoner_spells,
-            arena_augments,
-        })
-    }
-
-    pub fn find_champ(&self, name: &str) -> &ChampionShort {
-        if self.champ_data.contains_key(name) {
-            &self.champ_data[name]
-        } else {
-            let mut lowest_distance = usize::MAX;
-            let mut closest_champ: &ChampionShort = &self.champ_data["Annie"];
-
-            let mut substring_lowest_dist = usize::MAX;
-            let mut substring_closest_champ: Option<&ChampionShort> = None;
-
-            for value in self.champ_data.values() {
-                let query_compare = name.to_ascii_lowercase();
-                let champ_compare = value.name.to_ascii_lowercase();
-                // Prefer matches where search query is an exact starting substring
-                let distance = levenshtein(query_compare.as_str(), champ_compare.as_str());
-                if champ_compare.starts_with(&query_compare) {
-                    if distance <= substring_lowest_dist {
-                        substring_lowest_dist = distance;
-                        substring_closest_champ = Some(value);
-                    }
-                } else if distance <= lowest_distance {
-                    lowest_distance = distance;
-                    closest_champ = value;
-                }
-            }
-
-            substring_closest_champ.unwrap_or(closest_champ)
+        Self {
+            client,
+            api_version: "15.1.1".to_string(), // Mặc định, sẽ được cập nhật sau
         }
     }
 
-    pub async fn get_stats(
+    /// Lấy version mới nhất từ DDragon (Async)
+    pub async fn fetch_current_version(&mut self) -> Result<String> {
+        let versions: Vec<String> = self
+            .client
+            .get("https://ddragon.leagueoflegends.com/api/versions.json")
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if let Some(ver) = versions.first() {
+            self.api_version = ver.clone();
+        }
+        Ok(self.api_version.clone())
+    }
+
+    /// Lấy Overview (Build, Runes) của tướng (Async)
+    pub async fn get_overview(
         &self,
-        champ: &ChampionShort,
-        role: mappings::Role,
-        region: mappings::Region,
-        mode: mappings::Mode,
-        build: mappings::Build,
-    ) -> Result<(Overview, mappings::Role), UggError> {
-        self.api.get_stats(
-            &self.patch_version,
+        champ: &str,
+        mode: Mode,
+        role: Role,
+        region: Region,
+    ) -> Result<Box<Overview>> {
+        let region_query = if region == Region::World {
+            "".to_string()
+        } else {
+            format!("&regionId={}", region as i32)
+        };
+
+        let role_query = if role == Role::Automatic {
+            "".to_string()
+        } else {
+            format!("&roleId={}", role as i32)
+        };
+
+        let url = format!(
+            "https://stats2.u.gg/lol/1.5/overview/{}/{}/{}/{}.json?{}",
+            self.api_version,
+            mode.to_api_string(),
             champ,
-            role,
-            region,
-            mode,
-            build,
-            &self.api_versions,
-        ).await
+            "1.5.0", // Hardcoded minor version for UGG API consistency
+            format!("{}{}", region_query, role_query)
+        );
+
+        let response = self.client.get(&url).send().await?;
+        let overview = response.json::<Overview>().await?;
+        
+        Ok(Box::new(overview))
     }
 
+    /// Lấy Matchups (Async)
     pub async fn get_matchups(
         &self,
-        champ: &ChampionShort,
-        role: mappings::Role,
-        region: mappings::Region,
-        mode: mappings::Mode,
-    ) -> Result<(MatchupData, mappings::Role), UggError> {
-        self.api.get_matchups(
-            &self.patch_version,
+        champ: &str,
+        mode: Mode,
+        role: Role,
+        region: Region,
+    ) -> Result<Box<MatchupData>> {
+        let region_query = if region == Region::World {
+            "".to_string()
+        } else {
+            format!("&regionId={}", region as i32)
+        };
+
+        let role_query = if role == Role::Automatic {
+            "".to_string()
+        } else {
+            format!("&roleId={}", role as i32)
+        };
+
+        let url = format!(
+            "https://stats2.u.gg/lol/1.5/matchups/{}/{}/{}/{}.json?{}",
+            self.api_version,
+            mode.to_api_string(),
             champ,
-            role,
-            region,
-            mode,
-            &self.api_versions,
-        ).await
+            "1.5.0",
+            format!("{}{}", region_query, role_query)
+        );
+
+        let response = self.client.get(&url).send().await?;
+        let matchups = response.json::<MatchupData>().await?;
+
+        Ok(Box::new(matchups))
     }
 }
-
-pub struct UggApiBuilder {
-    version: Option<String>,
-    cache_dir: Option<PathBuf>,
-}
-
-impl UggApiBuilder {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            version: None,
-            cache_dir: None,
-        }
-    }
-
-    #[must_use]
-    pub fn version(mut self, version: &str) -> Self {
-        self.version = Some(version.to_owned());
-        self
-    }
-
-    #[must_use]
-    pub fn cache_dir(mut self, cache_dir: &Path) -> Self {
-        self.cache_dir = Some(cache_dir.to_path_buf());
-        self
-    }
-
-    pub async fn build(self) -> Result<UggApi, UggError> {
-        UggApi::new(self.version, self.cache
